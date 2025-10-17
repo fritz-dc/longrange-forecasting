@@ -1,0 +1,9 @@
+Steps:
+1. Download all won opportunities from SFDC
+2. Append to or overwrite raw data in SFDC Won Opps.xlsx
+3. Pivot the raw data to generate monthly aggregates
+4. Append new data to SFDC Won Data FY16 pivot.csv
+5. Run Longrun Forecasting Finalcopy.ipynb, editing team_config object as needed
+6. Paste forecasts and stddev from quarterly_forecasts_fy26_fy29.csv to 'Forecasts' tab in Multi-year Monte Carlo Simulator V1 (Sheets)
+7. Execute simulation (Menu>Monte Carlo>Run Simluation), editing values on 'Params' tab as needed
+8. Use data from 'Results_Charts' tab
