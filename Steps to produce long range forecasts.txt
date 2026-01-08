@@ -1,5 +1,5 @@
 Steps:
-1. Download latest SFDC Won Data FY16 pivot
+1. Download latest SFDC Won Data FY16 pivot.csv
 2. Append to or overwrite with actual and forecast values based on core metrics dashboard
 3. Run latest Longrun Forecasting.ipynb
 4. Copy Multi-year Monte Carlo Simulator (Sheets) and rename it for the new fiscal quarter
