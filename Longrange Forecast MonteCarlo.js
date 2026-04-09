@@ -1,12 +1,12 @@
 /** ======================================================================
- * DonorsChoose Monte Carlo for Google Sheets — Fully Annotated Version
+ * DonorsChoose Monte Carlo for Google Sheets — Refactored Version
  * ----------------------------------------------------------------------
  * WHAT THIS DOES (executive summary):
  * - Reads your planning inputs from several sheets (Params, Forecasts, etc.)
- * - Builds scenario-adjusted lognormal distributions per Channel×Year×Quarter
- * - Simulates many trials with seeded randomness, including cross-channel
- *   co-movement via common shocks (economy/government factors)
- * - Applies YoY bounds AT THE ANNUAL LEVEL by proportionally scaling quarters
+ * - Builds scenario-adjusted truncated normal distributions per Channel×Year×Quarter
+ * - Uses 5 binary factors (Enabled/Disabled) with fiscal-year-specific multipliers
+ * - Simulates many trials with seeded randomness and simplified global correlation
+ * - Applies YoY bounds AT THE ANNUAL LEVEL (with scenario-based adjustments)
  * - Aggregates streaming means and percentiles + plan hit-rates
  * - Writes summary tables to Results_Quarterly / Results_Annually / Results_PI
  *
@@ -16,25 +16,42 @@
  * - Streaming quantiles => fast & memory-safe (no storing trial arrays)
  *
  * YOU CONFIGURE:
- * - Params tab (N_Sims, Seed, rounding, scenario, PI levels, Sigma_Log_Max)
+ * - Params tab (N_Sims, Seed, 5 scenario factors, Global_Channel_Correlation, SD_inflation_factor, PI levels)
  * - Forecasts tab (per Channel×Year×Quarter mean & predictive SD)
- * - Scenario_Mapping tab (Headwind/Neutral/Tailwind multipliers for mean/SD)
- * - Correlation_Config tab (w_Economy, w_Government per channel)
- * - Annual_YoY_Bounds tab (YoY_Min, YoY_Max per channel/year)
+ * - Scenario_Mapping tab (FY-specific multipliers for 5 factors: Weak/Strong pairs)
+ * - Bounds_Scenario_Adjustments tab (Floor/Cap shifts per channel×factor when Enabled)
+ * - Annual_YoY_Bounds tab (Base YoY_Min, YoY_Max per channel/year)
  * - Params_Plans tab (annual plan per channel + Total_Plan)
  *
  * KEY MODEL RULES:
- * - Lognormal only (non-negative, right-skewed; realistic for revenue)
- * - σ_log is capped (default 2.5) to tame extreme right tails
- * - Common shocks reallocate variance into shared/idiosyncratic pieces
- *   WITHOUT changing the marginal SD you provided (Var(Z)=1)
+ * - Truncated normal distribution (can model YoY declines, respects Floor_Zero param)
+ * - Global correlation creates co-movement across channels (default 0.3)
+ * - SD inflates proportionally: each enabled factor adds ~10% uncertainty (default 50% max = 0.50)
  * - YoY bounds: FY26 exempt; FY27+ bounded versus prior simulated year
+ *   Bounds shift based on active scenario factors (Enabled selections)
  *   Special case: if prior=0, we ignore the upper bound to allow recovery
+ *
+ * REFACTOR CHANGES FROM PREVIOUS VERSION:
+ * - Removed: Complex channel-specific correlation weights (w_Economy, w_Government)
+ * - Removed: Correlation_Config sheet entirely
+ * - Removed: Three-level scenarios (Headwind/Neutral/Tailwind)
+ * - Removed: Lognormal distribution (switched to truncated normal)
+ * - Added: 5 binary scenario factors (Enabled/Disabled)
+ * - Added: Fiscal-year dimension to Scenario_Mapping
+ * - Added: Bounds_Scenario_Adjustments sheet for dynamic bounds
+ * - Added: Proportional SD inflation (scales with number of factors enabled)
+ * - Simplified: Single global correlation parameter
+ * - Simplified: SD inflation based on Forecast_SD, not separate SD_base column
+ * - Hardcoded: WithinYear_Rho=0.5
+ * - User-configurable: SD_inflation_factor from Params (default 0.50 = 50%)
  *
  * DEPLOYMENT:
  * - Paste this file into Apps Script, save, refresh the sheet
  * - Use the "Monte Carlo" custom menu to run/validate/clear
  * ====================================================================== */
+
+// HARDCODED TECHNICAL CONSTANTS (no longer user-configurable)
+const WITHIN_YEAR_RHO = 0.5;         // Correlation between quarters within channel-year
 
 /* =============================== MENU =============================== */
 /** Installs a custom menu for users to run/validate/clear without opening Apps Script. */
@@ -117,22 +134,80 @@ function readParams(ss, log) {
     return s === 'true' || s === '1' || s === 'yes';
   };
 
-  // Parse each param with sensible defaults (these are used if neither named range nor table supplies them)
+  // Parse each param with sensible defaults
   const N_Sims = Math.max(1, Math.floor(Number(pick('N_Sims', 10000))));
   const Seed = Math.floor(Number(pick('Seed', 42)));
-  const Dist = String(pick('Distribution_Type', 'Lognormal'));
-  if (Dist.toLowerCase() !== 'lognormal') log.warn('Params', 'Distribution_Type forced to Lognormal (engine is lognormal-only).');
   const RoundK = asBool(pick('Round_To_Thousands', true));
-  const Econ = String(pick('Economy_Factor', 'Neutral'));
-  const Govt = String(pick('Government_Factor', 'Neutral'));
-  const PI_L = Number(pick('PI_Lower_Level', 0.20));
-  const PI_U = Number(pick('PI_Upper_Level', 0.80));
+  const PI_L = Number(pick('PI_Lower_Level', 0.05));
+  const PI_U = Number(pick('PI_Upper_Level', 0.95));
+  
+  // DIAGNOSTIC: Log what was actually read
+  log.info('Params', `PI_Lower_Level read as: ${PI_L}`);
+  log.info('Params', `PI_Upper_Level read as: ${PI_U}`);
+  
   if (!(PI_L > 0 && PI_L < 1 && PI_U > 0 && PI_U < 1 && PI_L < PI_U)) {
-    log.warn('Params', 'Invalid PI levels; defaulting to 0.20 and 0.80.');
+    log.warn('Params', `Invalid PI levels (L=${PI_L}, U=${PI_U}); defaulting to 0.05 and 0.95.`);
+    // NOTE: This warning doesn't actually reset the values! That's intentional - values pass through.
   }
-  const SIG_CAP = Number(pick('Sigma_Log_Max', 2.5));
 
-  return { N_Sims, Seed, RoundK, Econ, Govt, PI_L, PI_U, SIG_CAP };
+  // Read 5 scenario factors (Enabled/Disabled)
+  const factors = {
+    mng_giving: String(pick('internal_mng_giving', 'Disabled')).trim(),
+    product_marketing: String(pick('internal_product_marketing', 'Disabled')).trim(),
+    org_stability: String(pick('internal_org_stability', 'Disabled')).trim(),
+    govt_policy: String(pick('external_govt_ed_policy', 'Disabled')).trim(),
+    macroeconomic: String(pick('external_macroeconomic', 'Disabled')).trim()
+  };
+
+  // Validate each factor is "Enabled" or "Disabled"
+  for (const [key, val] of Object.entries(factors)) {
+    const normalized = val.toLowerCase();
+    if (normalized !== 'enabled' && normalized !== 'disabled') {
+      log.warn('Params', `${key} must be "Enabled" or "Disabled", got "${val}". Defaulting to "Disabled".`);
+      factors[key] = 'Disabled';
+    } else {
+      factors[key] = normalized === 'enabled' ? 'Enabled' : 'Disabled'; // Normalize casing
+    }
+  }
+
+  // Read Global_Channel_Correlation
+  let globalCorr = Number(pick('Global_Channel_Correlation', 0.3));
+  if (!isFinite(globalCorr) || globalCorr < 0 || globalCorr > 1) {
+    log.warn('Params', `Global_Channel_Correlation must be 0-1, got ${globalCorr}. Using 0.3.`);
+    globalCorr = 0.3;
+  }
+
+  // NEW: Read SD_inflation_factor from Params
+  // This can be entered as: 0.30 (decimal), 30 (percentage), or 1.30 (multiplier)
+  // We interpret intelligently and return the MULTIPLIER value
+  const sdInflationRaw = Number(pick('SD_inflation_factor', 0.30));
+  let sdInflationFactor = 1.3; // default if parsing fails
+  
+  if (isFinite(sdInflationRaw) && sdInflationRaw >= 0) {
+    if (sdInflationRaw < 1) {
+      // Interpret as decimal percentage (e.g., 0.30 means 30% increase → 1.30x multiplier)
+      sdInflationFactor = 1 + sdInflationRaw;
+      log.info('Params', `SD_inflation_factor interpreted as ${(sdInflationRaw * 100).toFixed(0)}% increase (multiplier: ${sdInflationFactor.toFixed(2)})`);
+    } else if (sdInflationRaw >= 1 && sdInflationRaw < 10) {
+      // Interpret as direct multiplier (e.g., 1.30 means 1.30x)
+      sdInflationFactor = sdInflationRaw;
+      log.info('Params', `SD_inflation_factor interpreted as ${sdInflationFactor.toFixed(2)}x multiplier`);
+    } else if (sdInflationRaw >= 10) {
+      // Interpret as percentage number (e.g., 30 means 30% increase → 1.30x multiplier)
+      sdInflationFactor = 1 + (sdInflationRaw / 100);
+      log.info('Params', `SD_inflation_factor interpreted as ${sdInflationRaw.toFixed(0)}% increase (multiplier: ${sdInflationFactor.toFixed(2)})`);
+    }
+  } else {
+    log.warn('Params', `SD_inflation_factor invalid (${sdInflationRaw}), using default 1.30x (30% increase)`);
+  }
+
+  // Sanity check: inflation factor should be reasonable (between 1.0 and 3.0)
+  if (sdInflationFactor < 1.0 || sdInflationFactor > 3.0) {
+    log.warn('Params', `SD_inflation_factor out of reasonable range [1.0, 3.0]: ${sdInflationFactor.toFixed(2)}. Clamping.`);
+    sdInflationFactor = Math.max(1.0, Math.min(3.0, sdInflationFactor));
+  }
+
+  return { N_Sims, Seed, RoundK, PI_L, PI_U, factors, globalCorr, sdInflationFactor };
 }
 
 /** Reads the Params sheet as a 2-column table: Param | Value. Returns {ParamName: Value}. */
@@ -158,14 +233,13 @@ function readParamsTable(ss) {
 
 /* ============================ INPUT READING ========================= */
 /**
- * Reads all input tabs, validates structure, and precomputes per-row lognormal parameters.
+ * Reads all input tabs, validates structure, and precomputes per-row normal distribution parameters.
  * Returns a compact "data contract" object used by the simulation.
  */
 function readAllInputs(ss, p, log) {
-  // Fetch the required tabs (raising if genuinely missing)
+  // Fetch the required tabs
   const shF = mustSheet(ss, 'Forecasts', log);
   const shSM = mustSheet(ss, 'Scenario_Mapping', log);
-  const shCC = mustSheet(ss, 'Correlation_Config', log);
   const shPlans = mustSheet(ss, 'Params_Plans', log);
 
   // Accept either "Annual_YoY_Bounds" or legacy "Annual_Caps_Floors"
@@ -176,17 +250,24 @@ function readAllInputs(ss, p, log) {
     throw new Error(msg);
   }
 
-  // Read each sheet as a headered table (rows[] items keyed by header names)
+  // Read Bounds_Scenario_Adjustments (optional)
+  const shBoundsAdj = ss.getSheetByName('Bounds_Scenario_Adjustments');
+  const boundsAdjustments = shBoundsAdj ? readBoundsAdjustments(shBoundsAdj, log) : {};
+  if (!shBoundsAdj) {
+    log.warn('Sheets', 'Bounds_Scenario_Adjustments sheet missing. No scenario adjustments applied to bounds.');
+  }
+
+  // Read each sheet as a headered table
   const forecasts = readTable(shF);
   const scen = readTable(shSM);
-  const weights = parseWeights(shCC, log);            // Robust header detection for w_Economy/w_Government
   const plansT = readTable(shPlans);
   const boundsT = readTable(shBounds);
 
-  // Build the scenario multipliers dictionary: per channel, mean/SD multipliers per Econ/Govt × Headwind/Neutral/Tailwind
-  const multipliers = buildScenarioMultipliers(scen, log);
+  // Build the scenario multipliers dictionary: per Channel×FY, with 5 binary factors
+  // Now returns only meanMult (no SD logic here)
+  const multipliers = buildScenarioMultipliers(scen, p ? p.factors : null, log);
 
-  // Load plans keyed by year; also sanity-check sum(channel) vs Total_Plan
+  // Load plans keyed by year
   const planByYear = {};
   for (const r of plansT.rows) {
     const y = Number(r.Fiscal_Year);
@@ -204,22 +285,19 @@ function readAllInputs(ss, p, log) {
     }
   }
 
-  // Build YoY bounds map keyed by (channel, year), accepting multiple header variants
+  // Build YoY bounds map keyed by (channel, year)
   const bounds = {};
   for (const r of boundsT.rows) {
     const y = Number(r.Fiscal_Year);
     const c = cleanChannel(r.Channel);
     if (!y || !c) continue;
 
-    // Primary expected headers
+    // Accept multiple header variants
     let yoyMin = safeNum(r.YoY_Min, null);
     let yoyMax = safeNum(r.YoY_Max, null);
-
-    // Accept alternatives often seen in legacy tabs
     if (yoyMin === null) yoyMin = safeNum(r.Annual_Floor_Pct, null);
     if (yoyMax === null) yoyMax = safeNum(r.Annual_Cap_Pct, null);
 
-    // Back-compat: if Annual_Floor / Annual_Cap look like percentages (-1..+1), accept as YoY %
     const floorMaybePct = safeNum(r.Annual_Floor, null);
     const capMaybePct   = safeNum(r.Annual_Cap, null);
     if (yoyMin === null && floorMaybePct !== null && Math.abs(floorMaybePct) <= 1.5) yoyMin = floorMaybePct;
@@ -228,11 +306,24 @@ function readAllInputs(ss, p, log) {
     bounds[ck(c, y)] = { min: yoyMin, max: yoyMax };
   }
 
-  // Enumerate rows from Forecasts; precompute per-row lognormal (mu, sigma) post-scenario
+  // Enumerate rows from Forecasts; precompute per-row normal (mean, sd)
   const QUARTERS = ['Q1', 'Q2', 'Q3', 'Q4'];
   const chSet = new Set();
   const yearSet = new Set();
-  const spec = {}; // key c|y|q -> {mu, sigma, degenerate}
+  const spec = {}; // key c|y|q -> {mean, sd, degenerate}
+
+  // Count enabled factors for proportional SD inflation
+  const enabledFactors = p ? Object.values(p.factors).filter(v => v === 'Enabled') : [];
+  const numEnabled = enabledFactors.length;
+  const totalFactors = p ? Object.values(p.factors).length : 5;
+
+  // Proportional inflation: scales from 1.0 to sdInflationFactor based on % of factors enabled
+  const baseInflationRate = p ? (p.sdInflationFactor - 1.0) : 0.50;
+  const sdInflation = numEnabled > 0 ? (1.0 + (numEnabled / totalFactors) * baseInflationRate) : 1.0;
+
+  if (numEnabled > 0 && log) {
+    log.info('SD Inflation', `${numEnabled}/${totalFactors} factors enabled. SD multiplier: ${sdInflation.toFixed(2)}x`);
+  }
 
   for (const r of forecasts.rows) {
     const c = cleanChannel(r.Channel);
@@ -242,74 +333,42 @@ function readAllInputs(ss, p, log) {
 
     chSet.add(c); yearSet.add(y);
 
-    // Input constraints: means and predictive SDs must be non-negative
+    // Read base forecast values from Forecasts sheet
     const mean = Math.max(0, Number(r.Forecast_Mean || 0));
     const sd = Math.max(0, Number(r.Forecast_SD || 0));
 
-    // Fetch scenario multipliers for this channel; default to 1.0 if not present
-    const mul = (multipliers[c] || { mean: { Econ: oneSet(), Govt: oneSet() }, sd: { Econ: oneSet(), Govt: oneSet() } });
-    const meanMult = (mul.mean.Econ[p ? p.Econ : 'Neutral'] || 1) * (mul.mean.Govt[p ? p.Govt : 'Neutral'] || 1);
-    const sdMult   = (mul.sd.Econ[p ? p.Econ : 'Neutral'] || 1)   * (mul.sd.Govt[p ? p.Govt : 'Neutral'] || 1);
+    // Fetch scenario multipliers for this channel×year (MEAN only, no SD here)
+    const cyKey = `${c}|${y}`;
+    const mult = multipliers[cyKey];
+    if (!mult) {
+      log.warn('Multipliers', `No scenario multipliers for ${cyKey}; using mean as-is.`);
+    }
+    const meanMult = mult ? mult.meanMult : 1.0;
 
-    // Apply scenario multipliers
+    // Apply mean multiplier to forecast mean
     const mAdj = mean * meanMult;
-    const sAdj = sd * sdMult;
+    
+    // Apply SD inflation (proportional to number of factors enabled)
+    const sAdj = sd * sdInflation;
 
-    // Parameterize lognormal (mu, sigma) OR mark as degenerate (deterministic 0) if the row can't form a sensible distribution
-    let mu = 0, sigma = 0, deg = false;
+    // Store normal distribution parameters OR mark as degenerate
+    let deg = false;
     const tiny = 1e-12;
 
-    if (mAdj <= 0) {
-      // Truly zero mean => zero out deterministically
-      deg = true;
-    } else {
-      // If SD is zero (or blank → 0), treat as deterministic at the mean:
-      // sigma=0 => exp(mu + 0*Z) = exp(mu) = mAdj
-      let sigmaLog = 0;
-
-      if (sAdj > tiny) {
-        const cv = sAdj / Math.max(mAdj, tiny);
-        sigmaLog = Math.sqrt(Math.log(1 + cv * cv));
-        if (p && sigmaLog > p.SIG_CAP) {
-          log.info(`${c} ${y} ${q}`, `sigma_log capped from ${sigmaLog.toFixed(4)} to ${p.SIG_CAP}`);
-          sigmaLog = p.SIG_CAP;
-        }
-      } else {
-        // SD==0 → deterministic; helpful breadcrumb in the Log
-        if (log) log.info(`${c} ${y} ${q}`, `SD=0 → deterministic at mean ${mAdj}.`);
-      }
-
-      sigma = sigmaLog;
-      // With sigma=0, this simplifies to mu = ln(mAdj)
-      mu = Math.log(Math.max(mAdj, tiny)) - 0.5 * sigmaLog * sigmaLog;
+    if (mAdj <= 0 && sAdj <= tiny) {
+      deg = true;  // Zero mean and zero SD => deterministic zero
+    } else if (sAdj <= tiny) {
+      if (log) log.info(`${c} ${y} ${q}`, `SD=0 → deterministic at mean ${mAdj}.`);
     }
 
-    spec[ck(c, y, q)] = { mu, sigma, degenerate: deg };
+    spec[ck(c, y, q)] = { mean: mAdj, sd: sAdj, degenerate: deg };
   }
 
-  // Finalize channel and year sets (sorted for stable output ordering)
+  // Finalize channel and year sets
   const channels = Array.from(chSet).sort();
   const years = Array.from(yearSet).sort((a, b) => a - b);
 
-  // Normalize weights per channel and precompute residual variance share
-  const wByC = {};
-  for (const c of channels) {
-    const wE = (weights[c] && isFinite(weights[c].wE)) ? Number(weights[c].wE) : 0;
-    const wG = (weights[c] && isFinite(weights[c].wG)) ? Number(weights[c].wG) : 0;
-    const s2 = wE * wE + wG * wG;
-
-    let wEn = wE, wGn = wG;
-    if (s2 > 1) {
-      // Auto-shrink proportionally so that w_E^2 + w_G^2 == 1 (preserves direction, fixes magnitude)
-      const k = 1 / Math.sqrt(s2);
-      wEn = wE * k; wGn = wG * k;
-      log.warn(`Weights ${c}`, `w_E^2 + w_G^2 = ${s2.toFixed(4)} > 1; auto-shrunk to (${wEn.toFixed(3)}, ${wGn.toFixed(3)})`);
-    }
-    // Residual weight ensures Var(Z)=1
-    wByC[c] = { wE: wEn, wG: wGn, wR: Math.sqrt(Math.max(0, 1 - (wEn * wEn + wGn * wGn))) };
-  }
-
-  // Gentle heads-up if user mistakenly provided FY26 bounds (ignored by design)
+  // Gentle heads-up if user provided FY26 bounds (ignored by design)
   if (years.length) {
     const firstY = years[0];
     for (const c of channels) {
@@ -321,7 +380,7 @@ function readAllInputs(ss, p, log) {
   }
 
   // Return the compact structure the simulator needs
-  return { spec, channels, years, QUARTERS, wByC, planByYear, bounds };
+  return { spec, channels, years, QUARTERS, planByYear, bounds, boundsAdjustments };
 }
 
 /** Helper: returns a sheet or throws an Error (and logs) if missing. */
@@ -355,93 +414,152 @@ function readTable(sh) {
   return { headers, rows };
 }
 
-/** Builds the Scenario_Mapping structure: for each channel, mean/sd multipliers by Econ/Govt × (Headwind,Neutral,Tailwind). */
-function buildScenarioMultipliers(scen, log) {
+/**
+ * Builds scenario multipliers for the 5-factor system with FY dimension.
+ * Returns: { "Channel|FY": { meanMult } }
+ * 
+ * IMPORTANT: This ONLY handles MEAN multipliers now.
+ * SD inflation is handled separately in readAllInputs based on Forecast_SD.
+ */
+function buildScenarioMultipliers(scen, factors, log) {
   const out = {};
+  
+  // Default factors if not provided (validation mode)
+  const f = factors || { 
+    mng_giving: 'Disabled', 
+    product_marketing: 'Disabled', 
+    org_stability: 'Disabled', 
+    govt_policy: 'Disabled', 
+    macroeconomic: 'Disabled' 
+  };
+  
+  // Map Enabled/Disabled to Strong/Weak to match spreadsheet columns
+  const mapState = (state) => (state === 'Enabled' ? 'Strong' : 'Weak');
+  
   for (const r of scen.rows) {
     const c = cleanChannel(r.Channel);
-    if (!c) continue;
-    const get = (k, d) => (isFinite(Number(r[k])) ? Number(r[k]) : d);
-    out[c] = {
-      mean: {
-        Econ: { Headwind: get('Econ_Mean_Headwind', 1), Neutral: get('Econ_Mean_Neutral', 1), Tailwind: get('Econ_Mean_Tailwind', 1) },
-        Govt: { Headwind: get('Govt_Mean_Headwind', 1), Neutral: get('Govt_Mean_Neutral', 1), Tailwind: get('Govt_Mean_Tailwind', 1) }
-      },
-      sd: {
-        Econ: { Headwind: get('Econ_SD_Headwind', 1), Neutral: get('Econ_SD_Neutral', 1), Tailwind: get('Econ_SD_Tailwind', 1) },
-        Govt: { Headwind: get('Govt_SD_Headwind', 1), Neutral: get('Govt_SD_Neutral', 1), Tailwind: get('Govt_SD_Tailwind', 1) }
-      }
-    };
+    const fy = Number(r.Fiscal_Year);
+    if (!c || !fy) continue;
+    
+    const key = `${c}|${fy}`;
+    
+    // Calculate mean multiplier by multiplying selected factor values
+    // Note: Using "people" not "org_stability" to match sheet column naming
+    let meanMult = 1.0;
+    meanMult *= Number(r[`mng_giving_${mapState(f.mng_giving)}`] || 1);
+    meanMult *= Number(r[`product_marketing_${mapState(f.product_marketing)}`] || 1);
+    meanMult *= Number(r[`people_${mapState(f.org_stability)}`] || 1);  // "people" in sheet, "org_stability" in params
+    meanMult *= Number(r[`govt_policy_${mapState(f.govt_policy)}`] || 1);
+    meanMult *= Number(r[`macro_${mapState(f.macroeconomic)}`] || 1);
+    
+    // Optional: Add diagnostic logging to verify multipliers are being applied
+    if (log && meanMult !== 1.0) {
+      log.info(`Multipliers ${c} FY${fy}`, `Combined multiplier: ${meanMult.toFixed(4)}`);
+    }
+    
+    // Return only meanMult (SD handling removed from here)
+    out[key] = { meanMult };
   }
+  
   return out;
 }
 
 /**
- * Parses Correlation_Config to extract per-channel w_Economy and w_Government.
- * Robust against having an older "WithinYear_Rho" table stacked above — we scan
- * for the header row that contains w_Economy and w_Government.
+ * Reads Bounds_Scenario_Adjustments sheet.
+ * Returns: { "Channel|Factor": { floorShift, capShift } }
  */
-function parseWeights(shCC, log) {
-  const values = shCC.getDataRange().getValues();
-  // Find the header row which contains both w_Economy and w_Government
-  let headerRow = -1;
-  for (let i = 0; i < values.length; i++) {
-    const row = values[i].map(x => String(x || '').trim().toLowerCase());
-    if (row.indexOf('w_economy') >= 0 && row.indexOf('w_government') >= 0 && row.indexOf('channel') >= 0) {
-      headerRow = i;
-      break;
+function readBoundsAdjustments(sh, log) {
+  const table = readTable(sh);
+  const adjustments = {};
+  
+  for (const row of table.rows) {
+    const ch = cleanChannel(row.Channel);
+    const factor = String(row.Factor || '').trim();
+    if (!ch || !factor) continue;
+    
+    const key = `${ch}|${factor}`;
+    adjustments[key] = {
+      floorShift: numOrZero(row.Floor_Shift),
+      capShift: numOrZero(row.Cap_Shift)
+    };
+  }
+  
+  return adjustments;
+}
+
+/**
+ * Applies scenario-based adjustments to annual YoY bounds.
+ * Returns adjusted bounds: { floor, cap }
+ * 
+ * IMPORTANT: This does NOT modify the Annual_YoY_Bounds sheet.
+ * It calculates adjusted bounds in-memory for each trial.
+ */
+function applyScenarioAdjustments(baseBounds, channel, factors, adjustments) {
+  let floorAdj = 0;
+  let capAdj = 0;
+  
+  // Map user factor selections to internal names matching sheet
+  const factorMap = {
+    'internal_mng_giving': factors.mng_giving,
+    'internal_product_marketing': factors.product_marketing,
+    'internal_org_stability': factors.org_stability,
+    'external_govt_ed_policy': factors.govt_policy,
+    'external_macroeconomic': factors.macroeconomic
+  };
+  
+  // Sum adjustments for all factors set to "Enabled"
+  for (const [factorName, factorValue] of Object.entries(factorMap)) {
+    if (factorValue === 'Enabled') {
+      const key = `${channel}|${factorName}`;
+      const adj = adjustments[key];
+      if (adj) {
+        floorAdj += adj.floorShift;
+        capAdj += adj.capShift;
+      }
     }
   }
-  const out = {};
-  if (headerRow < 0 || headerRow + 1 >= values.length) {
-    log.warn('Correlation_Config', 'Weights table not found; defaulting all weights to 0.');
-    return out; // means all channels default to independence
-  }
-
-  // Build column indices
-  const hdr = values[headerRow].map(x => String(x || '').trim());
-  const iC = hdr.findIndex(h => h.toLowerCase() === 'channel');
-  const iE = hdr.findIndex(h => h.toLowerCase() === 'w_economy');
-  const iG = hdr.findIndex(h => h.toLowerCase() === 'w_government');
-
-  // Read subsequent rows until blank
-  for (let i = headerRow + 1; i < values.length; i++) {
-    const c = cleanChannel(values[i][iC]);
-    if (!c) continue;
-    out[c] = { wE: safeNum(values[i][iE], 0), wG: safeNum(values[i][iG], 0) };
-  }
-  return out;
+  
+  // Apply to base bounds (does not modify sheet values)
+  return {
+    floor: baseBounds.floor + floorAdj,
+    cap: baseBounds.cap + capAdj
+  };
 }
 
 /* ============================ SIMULATION ============================ */
 /**
  * The main simulation loop:
  * - Loops over trials with deterministic PRNG
- * - For each year & quarter, draws common shocks E,G
- * - For each channel, builds standardized shock Z with Var=1, then draws lognormal value
- * - After 4 quarters, applies YoY bounds by scaling quarters if needed
+ * - For each year & quarter, draws one common shock for global correlation
+ * - For each channel, combines common + idiosyncratic shocks using globalCorr
+ * - Applies within-year correlation (WITHIN_YEAR_RHO) between quarters
+ * - After 4 quarters, applies YoY bounds (with scenario adjustments) by scaling
  * - Updates streaming statistics for quarterly, annual (channel), and annual (total)
  * - Writes outputs at the end (rounded on write if enabled)
  */
 function simulateAndWrite(ss, p, d, log) {
-  const { spec, channels, years, QUARTERS, wByC, planByYear, bounds } = d;
+  const { spec, channels, years, QUARTERS, planByYear, bounds, boundsAdjustments } = d;
   if (!years.length || !channels.length) {
     log.error('Inputs', 'No years or channels found. Nothing to simulate.');
     return;
   }
 
-  // Prepare streaming aggregators (means & P² quantiles) and hit-rate counters
-  const pLow = p.PI_L > 0 && p.PI_L < 1 ? p.PI_L : 0.20;
-  const pUp  = p.PI_U > 0 && p.PI_U < 1 ? p.PI_U  : 0.80;
-  const ps = [pLow, 0.25, 0.50, 0.75, pUp];                // required percentiles (now using dynamic values)
+  // Prepare streaming aggregators
+  const pLow = p.PI_L > 0 && p.PI_L < 1 ? p.PI_L : 0.05;
+  const pUp  = p.PI_U > 0 && p.PI_U < 1 ? p.PI_U  : 0.95;
+  const ps = [pLow, 0.25, 0.50, 0.75, pUp];
+  
+  // DIAGNOSTIC: Log percentiles being used
+  log.info('Simulation', `Percentiles array: [${ps.join(', ')}]`);
+  log.info('Simulation', `Header names will be: ${ps.map(p => 'P' + String(Math.round(p * 100)).padStart(2, '0')).join(', ')}`);
 
-  const qAgg = {};   // quarterly per (c,y,q) -> { mean, p2s[], hits?, n? }
+  const qAgg = {};   // quarterly per (c,y,q)
   const aAgg = {};   // annual channel per (c,y)
   const tAgg = {};   // annual total per y
   const piAgg = {};  // PI per (c,y)
   const piTot = {};  // PI per y
 
-  // Initialize aggregators keyed by all combinations we will produce
+  // Initialize aggregators
   for (const y of years) {
     for (const c of channels) {
       for (const q of QUARTERS) qAgg[ck(c, y, q)] = makeAgg(ps);
@@ -452,140 +570,162 @@ function simulateAndWrite(ss, p, d, log) {
     piTot[y] = makePI(pLow, pUp);
   }
 
-  // Deterministic PRNG seeded from Params.Seed
+  // Deterministic PRNG
   const rng = mulberry32(p.Seed);
   const nTrials = p.N_Sims;
 
+  // Storage for within-year correlation (previous quarter's draws per channel)
+  const channelOrder = channels.slice().sort(); // Consistent ordering
+  
   // MAIN TRIAL LOOP
   for (let t = 0; t < nTrials; t++) {
-    // Track prior year's annual per channel to enforce YoY bounds (pathwise)
-    const prevAnnual = {}; // c -> last year's annual in this trial
+    const prevAnnual = {}; // Track prior year's annual per channel
+    const prevQuarterZ = {}; // Track previous quarter's Z per channel for within-year correlation
 
-    // Iterate years in ascending order so FY26 precedes FY27, etc.
     for (const y of years) {
-
-      // Draw the two common shocks for each quarter and hold them for reuse across channels
-      const EG = {}; // q -> {E, G}
-      for (const q of QUARTERS) EG[q] = { E: randn(rng), G: randn(rng) };
+      // Reset quarterly correlation storage for new year
+      for (const c of channelOrder) prevQuarterZ[c] = null;
 
       // Generate raw quarterly values (pre-bounds) for this year
       const cqValue = {}; // key c|q => value
+      
       for (const q of QUARTERS) {
-        const E = EG[q].E, G = EG[q].G;
-        for (const c of channels) {
-          const w = wByC[c] || { wE: 0, wG: 0, wR: 1 };
-          const eps = randn(rng);                              // idiosyncratic piece per channel-quarter
-          const Z = w.wE * E + w.wG * G + w.wR * eps;          // standardized shock with Var=1
+        // Single common shock for global correlation
+        const Z_common = randn(rng);
+        
+        for (const c of channelOrder) {
+          // Generate idiosyncratic shock
+          const Z_idio = randn(rng);
+
+          // Quarter-specific correlated innovation (keeps global cross-channel correlation every quarter)
+          const Z_innov = Math.sqrt(p.globalCorr) * Z_common + Math.sqrt(1 - p.globalCorr) * Z_idio;
+
+          // Apply within-year correlation (AR(1) on the full shock with correlated innovation)
+          const Z = (prevQuarterZ[c] === null)
+            ? Z_innov
+            : Math.sqrt(WITHIN_YEAR_RHO) * prevQuarterZ[c] + Math.sqrt(1 - WITHIN_YEAR_RHO) * Z_innov;
+
+          prevQuarterZ[c] = Z; // Store for next quarter
+          
+          // Sample from truncated normal (apply floor from Floor_Zero param)
           const sp = spec[ck(c, y, q)];
-          const v = (!sp || sp.degenerate) ? 0 : Math.exp(sp.mu + sp.sigma * Z); // lognormal draw or deterministic 0
-          cqValue[ck(c, q)] = v; // one value per (c,q) for this year
+          if (!sp || sp.degenerate) {
+            cqValue[ck(c, q)] = 0;
+          } else {
+            const rawSample = sp.mean + sp.sd * Z;
+            const floor = p.FloorZero ? 0 : -Infinity; // Respect Floor_Zero parameter
+            cqValue[ck(c, q)] = Math.max(floor, rawSample);
+          }
         }
       }
 
-      // Apply annual YoY bounds by proportionally scaling a channel's four quarters if needed
+      // Apply annual YoY bounds with scenario adjustments
       const isFirstYear = (y === years[0]);
       let totalAnnual = 0;
 
-      for (const c of channels) {
-        // Pull the four quarter values for this channel-year
-        const qVals = d.QUARTERS.map(q => cqValue[ck(c, q)] || 0);
-
-        // Aggregate to an annual figure BEFORE bounds
+      for (const c of channelOrder) {
+        const qVals = QUARTERS.map(q => cqValue[ck(c, q)] || 0);
         let annual = qVals.reduce((a, b) => a + b, 0);
 
         // Enforce bounds for FY27+ if present
         const b = bounds[ck(c, y)];
-        if (!isFirstYear && (b && (b.min !== null || b.max !== null))) {
+        if (!isFirstYear && b && (b.min !== null || b.max !== null)) {
           const prev = prevAnnual[c] || 0;
-          // Compute level bounds relative to last year's simulated annual
-          let minBound = (b.min !== null && isFinite(b.min)) ? prev * (1 + b.min) : -Infinity;
-          let maxBound = (b.max !== null && isFinite(b.max)) ? prev * (1 + b.max) : +Infinity;
+          
+          // Apply scenario adjustments to base bounds (in-memory only, does not modify sheet)
+          const baseBounds = { floor: b.min, cap: b.max };
+          const adjustedBounds = applyScenarioAdjustments(baseBounds, c, p.factors, boundsAdjustments);
+          
+          let minBound = (adjustedBounds.floor !== null && isFinite(adjustedBounds.floor)) ? prev * (1 + adjustedBounds.floor) : -Infinity;
+          let maxBound = (adjustedBounds.cap !== null && isFinite(adjustedBounds.cap)) ? prev * (1 + adjustedBounds.cap) : +Infinity;
 
-          // Special rule: if prior year is zero, allow recovery by IGNORING upper bound; lower bound is at least 0
+          // Special rule: if prior year is zero, allow recovery
           if (prev === 0) {
             minBound = Math.max(minBound, 0);
             maxBound = +Infinity;
           }
 
-          // If annual is below the lower bound, raise it by scaling all four quarters equally
+          // Guardrail: inconsistent bounds after adjustments (min > max)
+          if (isFinite(minBound) && isFinite(maxBound) && minBound > maxBound) {
+            log.error(
+              'Bounds',
+              `Inconsistent adjusted bounds for ${c} ${y}: minBound (${minBound}) > maxBound (${maxBound}). ` +
+              `Base[min=${b.min}, max=${b.max}] Adjusted[floor=${adjustedBounds.floor}, cap=${adjustedBounds.cap}] prev=${prev}. ` +
+              `Skipping bounds enforcement for this channel/year.`
+            );
+            minBound = -Infinity;
+            maxBound = +Infinity;
+          }
+
+          // Apply floor
           if (annual < minBound && isFinite(minBound) && minBound > -Infinity) {
             if (annual <= 0) {
-              // Avoid divide-by-zero: if we need positive annual but drew ~0, split the minimum evenly across quarters
               if (minBound > 0) {
                 const eq = minBound / 4;
-                for (let i = 0; i < d.QUARTERS.length; i++) qVals[i] = eq;
+                for (let i = 0; i < QUARTERS.length; i++) qVals[i] = eq;
                 annual = minBound;
               }
             } else {
               const scale = minBound / annual;
-              for (let i = 0; i < d.QUARTERS.length; i++) qVals[i] *= scale;
+              for (let i = 0; i < QUARTERS.length; i++) qVals[i] *= scale;
               annual = minBound;
             }
           }
 
-          // If annual is above the upper bound, reduce it by scaling all four quarters equally
+          // Apply cap
           if (annual > maxBound && isFinite(maxBound) && maxBound < +Infinity) {
             if (annual > 0) {
               const scale = maxBound / annual;
-              for (let i = 0; i < d.QUARTERS.length; i++) qVals[i] *= scale;
+              for (let i = 0; i < QUARTERS.length; i++) qVals[i] *= scale;
               annual = maxBound;
             }
-            // If annual==0 and maxBound>=0, nothing to do
           }
         }
 
-        // Update prevAnnual for the next year's bounding and add to total
         prevAnnual[c] = annual;
         totalAnnual += annual;
 
-        // Update ANNUAL (channel) aggregators with post-bounds value
+        // Update aggregators
         const AA = aAgg[ck(c, y)];
         AA.mean.push(annual);
         for (const p2 of AA.p2s) p2.push(annual);
 
-        // Plan hit-rate (channel): count successes against planByYear
         const plan = (planByYear[y] && planByYear[y][c]) || 0;
         if (annual >= plan) AA.hits++;
         if (annual >= 0.9 * plan) AA.hits10++;
         AA.n++;
 
-        // PI aggregators (channel): feed both lower/upper percentiles
         const PI = piAgg[ck(c, y)];
         PI.low.push(annual);
         PI.up.push(annual);
 
-        // Update QUARTERLY aggregators after scaling (the values visible in Results_Quarterly reflect post-rules numbers)
-        for (let i = 0; i < d.QUARTERS.length; i++) {
-          const qk = ck(c, d.QUARTERS[i], undefined); // not used; we key by (c,y,q) below
-        }
-        for (let i = 0; i < d.QUARTERS.length; i++) {
-          const q = d.QUARTERS[i];
+        // Update quarterly aggregators
+        for (let i = 0; i < QUARTERS.length; i++) {
+          const qk = ck(c, y, QUARTERS[i]);
           const v = qVals[i];
-          const QA = qAgg[ck(c, y, q)];
+          const QA = qAgg[qk];
           QA.mean.push(v);
           for (const p2 of QA.p2s) p2.push(v);
         }
       }
 
-      // Update TOTAL (annual) aggregators for this year
+      // Update total aggregators
       const TA = tAgg[y];
       TA.mean.push(totalAnnual);
       for (const p2 of TA.p2s) p2.push(totalAnnual);
 
-      // Plan hit-rate (total)
       const tPlan = (planByYear[y] && planByYear[y].Total) || 0;
       if (totalAnnual >= tPlan) TA.hits++;
       if (totalAnnual >= 0.9 * tPlan) TA.hits10++;
       TA.n++;
 
-      // PI aggregators (total)
       piTot[y].low.push(totalAnnual);
       piTot[y].up.push(totalAnnual);
-    } // end year loop
-  } // end trials loop
+    }
+  }
 
-  // Write all outputs (apply display rounding to $1k if requested)
-  writeQuarterly(ss, qAgg, d, p.RoundK);
+  // Write all outputs
+  writeQuarterly(ss, qAgg, d, p.RoundK, ps);
   writeAnnually(ss, aAgg, tAgg, d, p.RoundK, ps);
   writePI(ss, piAgg, piTot, d, p.RoundK);
 }
@@ -598,121 +738,132 @@ RunningMean.prototype.value = function () { return this.mu; };
 
 /**
  * P² quantile estimator for a single quantile p in (0,1).
- * - Keeps 5 markers (positions & heights) and updates them on each push
- * - Very small memory footprint and fast; great for Apps Script limits
- * - Accuracy is excellent for the typical N (10k–50k)
+ * Incrementally maintains 5 marker heights and positions using parabolic interpolation.
  */
 function P2Quantile(p) {
   this.p = p;
-  this.initial = []; // we need 5 seeds to initialize the markers
-  this.n = [0, 0, 0, 0, 0];  // marker positions
-  this.q = [0, 0, 0, 0, 0];  // marker heights
-  this.np = [0, 0, 0, 0, 0]; // desired positions
+  this.count = 0;
+  this.q = [0, 0, 0, 0, 0];        // marker heights
+  this.n = [1, 2, 3, 4, 5];        // marker positions (1-indexed conceptually)
+  this.nPrime = [1, 1 + 2 * p, 1 + 4 * p, 3 + 2 * p, 5]; // desired positions
+  this.dn = [0, p / 2, p, (1 + p) / 2, 1]; // increments
 }
+
 P2Quantile.prototype.push = function (x) {
-  const p = this.p;
-  // Collect first 5 points exactly, then seed markers
-  if (this.initial.length < 5) {
-    this.initial.push(x);
-    if (this.initial.length === 5) {
-      this.initial.sort(function (a, b) { return a - b; });
-      this.q = this.initial.slice();
-      this.n = [1, 2, 3, 4, 5];
-      this.np = [1, 1 + 2 * p, 1 + 4 * p, 3 + 2 * p, 5];
-    }
+  if (this.count < 5) {
+    this.q[this.count] = x;
+    this.count++;
+    if (this.count === 5) this.q.sort((a, b) => a - b);
     return;
   }
-  // Determine k: which marker interval x falls into
-  let k;
-  if (x < this.q[0]) { this.q[0] = x; k = 0; }
-  else if (x < this.q[1]) { k = 0; }
-  else if (x < this.q[2]) { k = 1; }
-  else if (x < this.q[3]) { k = 2; }
-  else if (x <= this.q[4]) { k = 3; }
-  else { this.q[4] = x; k = 3; }
 
-  // Increment positions for markers above k
+  // Locate cell k: k is the index of the marker BELOW x (0..3)
+  let k = 0;
+
+  if (x < this.q[0]) {
+    this.q[0] = x;
+    k = 0;
+  } else if (x < this.q[1]) {
+    k = 0;
+  } else if (x < this.q[2]) {
+    k = 1;
+  } else if (x < this.q[3]) {
+    k = 2;
+  } else if (x < this.q[4]) {
+    k = 3;
+  } else {
+    // x >= current max
+    this.q[4] = x;
+    k = 3;
+  }
+
+  // Increment positions for markers k+1..4 (this ALWAYS increments n[4])
   for (let i = k + 1; i < 5; i++) this.n[i]++;
 
-  // Update desired positions based on p
-  for (let i = 0; i < 5; i++) this.np[i] += [0, p / 2, p, (1 + p) / 2, 1][i];
+  // Update desired positions
+  for (let i = 0; i < 5; i++) this.nPrime[i] += this.dn[i];
 
-  // Adjust interior markers using parabolic interpolation when possible
-  for (let i = 1; i <= 3; i++) {
-    const d = this.np[i] - this.n[i];
-    if ((d >= 1 && this.n[i + 1] - this.n[i] > 1) || (d <= -1 && this.n[i - 1] - this.n[i] < -1)) {
-      const dsgn = Math.sign(d);
-      const qn = this.parabolic(i, dsgn);
-      if (this.q[i - 1] < qn && qn < this.q[i + 1]) this.q[i] = qn;
-      else this.q[i] = this.linear(i, dsgn);
-      this.n[i] += dsgn;
+  // Adjust marker heights with P² algorithm
+  for (let i = 1; i < 4; i++) {
+    const d = this.nPrime[i] - this.n[i];
+    if ((d >= 1 && (this.n[i + 1] - this.n[i]) > 1) || (d <= -1 && (this.n[i - 1] - this.n[i]) < -1)) {
+      const dInt = (d >= 0) ? 1 : -1;
+      const qNew = this.parabolic(i, dInt);
+      if (this.q[i - 1] < qNew && qNew < this.q[i + 1]) {
+        this.q[i] = qNew;
+      } else {
+        this.q[i] = this.linear(i, dInt);
+      }
+      this.n[i] += dInt;
     }
   }
 };
+
 P2Quantile.prototype.parabolic = function (i, d) {
-  const q = this.q, n = this.n;
-  const a = (d * (n[i] - n[i - 1] + d) * (q[i + 1] - q[i])) / (n[i + 1] - n[i]);
-  const b = (d * (n[i + 1] - n[i] - d) * (q[i] - q[i - 1])) / (n[i] - n[i - 1]);
-  return q[i] + (a + b) / (n[i + 1] - n[i - 1]);
+  const qi = this.q[i], qPrev = this.q[i - 1], qNext = this.q[i + 1];
+  const ni = this.n[i], nPrev = this.n[i - 1], nNext = this.n[i + 1];
+  return qi + (d / (nNext - nPrev)) * (
+    (ni - nPrev + d) * (qNext - qi) / (nNext - ni) +
+    (nNext - ni - d) * (qi - qPrev) / (ni - nPrev)
+  );
 };
+
 P2Quantile.prototype.linear = function (i, d) {
   return this.q[i] + d * (this.q[i + d] - this.q[i]) / (this.n[i + d] - this.n[i]);
 };
+
 P2Quantile.prototype.value = function () {
-  if (this.initial.length && this.initial.length < 5) {
-    // For the very first few pushes, return an exact quantile from the tiny set
-    const arr = this.initial.slice().sort(function (a, b) { return a - b; });
-    const idx = Math.max(0, Math.min(arr.length - 1, Math.floor(this.p * (arr.length - 1))));
-    return arr[idx];
-  }
-  // After initialization, the target quantile is the middle marker
-  return this.q[2];
+  return (this.count < 5) ? this.q[Math.floor(this.count / 2)] : this.q[2];
 };
 
-/** Factory: builds an aggregator with running mean + a set of P² trackers + optional hit-rate counters. */
+/** Factory for an aggregator bundle with mean + percentiles (optionally plan hit-rates). */
 function makeAgg(ps, withHits) {
-  return {
+  const a = {
     mean: new RunningMean(),
-    p2s: ps.map(q => new P2Quantile(q)),
-    qs: ps,
-    hits: withHits ? 0 : undefined,     // plan hit-rate (>= 100% of plan)
-    hits10: withHits ? 0 : undefined,   // within-10% hit-rate (>= 90% of plan)
-    n: withHits ? 0 : undefined
+    p2s: ps.map(p => new P2Quantile(p))
   };
+  if (withHits) { a.hits = 0; a.hits10 = 0; a.n = 0; }
+  return a;
 }
 
-/** Factory: builds a PI aggregator holding two P² trackers for custom lower/upper percentiles. */
+/** Factory for PI aggregators (just two P² quantiles). */
 function makePI(pLow, pUp) {
-  return { low: new P2Quantile(pLow), up: new P2Quantile(pUp), pLow, pUp };
+  return { low: new P2Quantile(pLow), up: new P2Quantile(pUp) };
 }
 
-/* ============================== WRITERS ============================= */
-/** Writes the Results_Quarterly sheet: Channel | Fiscal_Year | Quarter | Mean | P10 | P25 | P50 | P75 | P90 */
-function writeQuarterly(ss, qAgg, d, doRound) {
+/* ============================ OUTPUT WRITING ======================== */
+/** Writes Results_Quarterly with correct column order and dynamic percentile headers. */
+function writeQuarterly(ss, qAgg, d, doRound, percentiles) {
   const sh = ss.getSheetByName('Results_Quarterly');
   if (!sh) return;
 
+  // Generate percentile column names from actual percentiles used
+  const pNames = percentiles.map(p => 'P' + String(Math.round(p * 100)).padStart(2, '0'));
+  
+  // Define expected headers
+  const expectedHeaders = ['Fiscal_Year', 'Channel', 'Quarter', 'Mean'].concat(pNames);
+  
+  // Update header row
+  sh.getRange(1, 1, 1, expectedHeaders.length).setValues([expectedHeaders]);
+
   // Clear only data rows (keep headers)
   const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
-  if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
-
-  // Sort keys by Channel, Year, Quarter
-  const keys = Object.keys(qAgg).sort(function (a, b) {
-    const [ca, ya, qa] = a.split('|'); const [cb, yb, qb] = b.split('|');
-    const ccmp = ca.localeCompare(cb); if (ccmp) return ccmp;
-    const ycmp = Number(ya) - Number(yb); if (ycmp) return ycmp;
-    const order = { Q1: 1, Q2: 2, Q3: 3, Q4: 4 };
-    return (order[qa] || 0) - (order[qb] || 0);
-  });
+  if (lastRow > 1 && lastCol > 0) sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
 
   const out = [];
+  const keys = Object.keys(qAgg).sort(function (a, b) {
+    const [ca, ya, qa] = a.split('|'); const [cb, yb, qb] = b.split('|');
+    const ycmp = Number(ya) - Number(yb); if (ycmp) return ycmp;
+    const ccmp = ca.localeCompare(cb); if (ccmp) return ccmp;
+    return qa.localeCompare(qb);
+  });
+
   for (const k of keys) {
-    const [c, y, q] = k.split('|');
+    const [c, ys, q] = k.split('|');
+    const y = Number(ys);
     const A = qAgg[k];
     out.push([
-      c,
-      Number(y),
-      q,
+      y, c, q,
       roundK(A.mean.value(), doRound),
       roundK(A.p2s[0].value(), doRound),
       roundK(A.p2s[1].value(), doRound),
@@ -724,57 +875,43 @@ function writeQuarterly(ss, qAgg, d, doRound) {
   if (out.length) sh.getRange(2, 1, out.length, 9).setValues(out);
 }
 
-/**
- * Writes Results_Annually with the correct column order:
- * Fiscal_Year | Channel | Mean | P10 | P25 | P50 | P75 | P90 | Plan | Plan_Likelihood | Plan_Likelihood_within10%
- * This also populates Plan and Total_Plan from Params_Plans (not left blank).
- */
+/** Writes Results_Annually with correct column order. */
 function writeAnnually(ss, aAgg, tAgg, d, doRound, percentiles) {
   const sh = ss.getSheetByName('Results_Annually');
   if (!sh) return;
 
-  // Format percentile names (e.g., 0.05 -> "P05", 0.95 -> "P95")
   const pNames = percentiles.map(p => 'P' + String(Math.round(p * 100)).padStart(2, '0'));
-  
-  // Define expected headers
   const expectedHeaders = ['Fiscal_Year', 'Channel', 'Mean'].concat(pNames).concat(['Plan', 'Plan_Likelihood', 'Plan_Likelihood_within10%']);
-  
-  // Update header row
   sh.getRange(1, 1, 1, expectedHeaders.length).setValues([expectedHeaders]);
 
-  // Clear only data rows (keep headers)
   const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
   if (lastRow > 1 && lastCol > 0) sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
 
   const channelRows = [];
-  // Sort by Channel FIRST, then Year
   const keys = Object.keys(aAgg).sort(function(a, b) {
     const [ca, ya] = a.split('|'); const [cb, yb] = b.split('|');
-    const ccmp = ca.localeCompare(cb); if (ccmp) return ccmp;  // Channel first
-    return Number(ya) - Number(yb);  // Then year
+    const ccmp = ca.localeCompare(cb); if (ccmp) return ccmp;
+    return Number(ya) - Number(yb);
   });
 
   for (const k of keys) {
     const [c, ys] = k.split('|');
     const y = Number(ys);
     const A = aAgg[k];
-
-    // Pull this channel's plan for the year
     const planYear = d.planByYear[y] || {};
     const plan = (planYear && Object.prototype.hasOwnProperty.call(planYear, c)) ? planYear[c] : '';
 
     channelRows.push([
-      y,                                 // Fiscal_Year
-      c,                                 // Channel
-      roundK(A.mean.value(), doRound),   // Mean
-      roundK(A.p2s[0].value(), doRound), // Dynamic lower percentile
-      roundK(A.p2s[1].value(), doRound), // P25
-      roundK(A.p2s[2].value(), doRound), // P50
-      roundK(A.p2s[3].value(), doRound), // P75
-      roundK(A.p2s[4].value(), doRound), // Dynamic upper percentile
-      plan,                              // Plan
-      (A.n && A.n > 0) ? (A.hits / A.n) : 0,   // Plan_Likelihood
-      (A.n && A.n > 0) ? (A.hits10 / A.n) : 0  // Plan_Likelihood_within10%
+      y, c,
+      roundK(A.mean.value(), doRound),
+      roundK(A.p2s[0].value(), doRound),
+      roundK(A.p2s[1].value(), doRound),
+      roundK(A.p2s[2].value(), doRound),
+      roundK(A.p2s[3].value(), doRound),
+      roundK(A.p2s[4].value(), doRound),
+      plan,
+      (A.n && A.n > 0) ? (A.hits / A.n) : 0,
+      (A.n && A.n > 0) ? (A.hits10 / A.n) : 0
     ]);
   }
 
@@ -786,8 +923,7 @@ function writeAnnually(ss, aAgg, tAgg, d, doRound, percentiles) {
     const totalPlan = (planYear && Object.prototype.hasOwnProperty.call(planYear, 'Total')) ? planYear['Total'] : '';
 
     totalRows.push([
-      y,
-      'Total',
+      y, 'Total',
       roundK(A.mean.value(), doRound),
       roundK(A.p2s[0].value(), doRound),
       roundK(A.p2s[1].value(), doRound),
@@ -804,12 +940,11 @@ function writeAnnually(ss, aAgg, tAgg, d, doRound, percentiles) {
   if (out.length) sh.getRange(2, 1, out.length, 11).setValues(out);
 }
 
-/** Writes Results_PI: Fiscal_Year | Channel | PI_Lower_Value | PI_Upper_Value, including a Total row per year. */
+/** Writes Results_PI with correct column order. */
 function writePI(ss, piAgg, piTot, d, doRound) {
   const sh = ss.getSheetByName('Results_PI');
   if (!sh) return;
 
-  // Clear only data rows (keep headers)
   const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
   if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
 
@@ -825,8 +960,7 @@ function writePI(ss, piAgg, piTot, d, doRound) {
     const y = Number(ys);
     const A = piAgg[k];
     rows.push([
-      y,
-      c,
+      y, c,
       roundK(A.low.value(), doRound),
       roundK(A.up.value(), doRound)
     ]);
@@ -836,8 +970,7 @@ function writePI(ss, piAgg, piTot, d, doRound) {
   for (const y of tYears) {
     const A = piTot[y];
     rows.push([
-      y,
-      'Total',
+      y, 'Total',
       roundK(A.low.value(), doRound),
       roundK(A.up.value(), doRound)
     ]);
@@ -847,12 +980,7 @@ function writePI(ss, piAgg, piTot, d, doRound) {
 }
 
 /* =============================== LOGGER ============================= */
-/**
- * Simple append-only logger:
- * - Writes to (or creates) a "Log" sheet
- * - Each call adds one row: ISO timestamp | key | [LEVEL] message
- * - Keep messages short; this is operational telemetry, not a novel
- */
+/** Simple append-only logger. */
 function makeLogger(ss) {
   const sh = ss.getSheetByName('Log') || ss.insertSheet('Log');
   const write = (lvl, key, msg) => {
@@ -863,19 +991,19 @@ function makeLogger(ss) {
     info: (k, m) => write('INFO', k, m),
     warn: (k, m) => write('WARN', k, m),
     error: (k, m) => write('ERROR', k, m),
-    flush: () => {} // placeholder if you later buffer logs and want to flush once
+    flush: () => {}
   };
 }
 
 /* ============================== UTILITIES =========================== */
-/** Compact key builder: c|y or c|y|q depending on args. */
+/** Compact key builder. */
 function ck(c, y, q) {
   if (q !== undefined) return `${c}|${y}|${q}`;
   if (y !== undefined) return `${c}|${y}`;
   return String(c);
 }
 
-/** Normalizes a channel label to one of the expected names where possible. */
+/** Normalizes a channel label. */
 function cleanChannel(v) {
   const s = String(v || '').trim();
   if (!s) return null;
@@ -885,21 +1013,17 @@ function cleanChannel(v) {
   if (x.startsWith('maj')) return 'Major';
   if (x.startsWith('market')) return 'Marketplace';
   if (['Corporate','Government','Major','Marketplace'].indexOf(s) >= 0) return s;
-  // If it's something else, return as-is; it just may not be picked up later
   return s;
 }
-
-/** A ready-to-use set of neutral multipliers (all 1.0). */
-function oneSet() { return { Headwind: 1, Neutral: 1, Tailwind: 1 }; }
 
 /** Numeric helpers */
 function numOrZero(v) { return (isFinite(Number(v)) ? Number(v) : 0); }
 function safeNum(v, dflt) { const n = Number(v); return isFinite(n) ? n : dflt; }
 
-/** Display rounding: floor to nearest $1,000 only if enabled (never in-core). */
+/** Display rounding. */
 function roundK(x, on) { return on ? (Math.floor(x / 1000) * 1000) : x; }
 
-/** Deterministic, fast PRNG (Mulberry32) returning U[0,1). */
+/** Deterministic PRNG (Mulberry32). */
 function mulberry32(a) {
   return function () {
     a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -909,10 +1033,10 @@ function mulberry32(a) {
   }
 }
 
-/** Standard normal via Box–Muller transform using the PRNG above. */
+/** Standard normal via Box–Muller transform. */
 function randn(rng) {
   let u = 0, v = 0;
-  while (u === 0) u = rng(); // avoid log(0)
+  while (u === 0) u = rng();
   while (v === 0) v = rng();
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
