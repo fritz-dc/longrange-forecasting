@@ -138,12 +138,14 @@ function readParams(ss, log) {
   const N_Sims = Math.max(1, Math.floor(Number(pick('N_Sims', 10000))));
   const Seed = Math.floor(Number(pick('Seed', 42)));
   const RoundK = asBool(pick('Round_To_Thousands', true));
+  const FloorZero = asBool(pick('Floor_Zero', true));
   const PI_L = Number(pick('PI_Lower_Level', 0.05));
   const PI_U = Number(pick('PI_Upper_Level', 0.95));
   
   // DIAGNOSTIC: Log what was actually read
   log.info('Params', `PI_Lower_Level read as: ${PI_L}`);
   log.info('Params', `PI_Upper_Level read as: ${PI_U}`);
+  log.info('Params', `Floor_Zero read as: ${FloorZero}`);
   
   if (!(PI_L > 0 && PI_L < 1 && PI_U > 0 && PI_U < 1 && PI_L < PI_U)) {
     log.warn('Params', `Invalid PI levels (L=${PI_L}, U=${PI_U}); defaulting to 0.05 and 0.95.`);
@@ -207,7 +209,7 @@ function readParams(ss, log) {
     sdInflationFactor = Math.max(1.0, Math.min(3.0, sdInflationFactor));
   }
 
-  return { N_Sims, Seed, RoundK, PI_L, PI_U, factors, globalCorr, sdInflationFactor };
+  return { N_Sims, Seed, RoundK, FloorZero, PI_L, PI_U, factors, globalCorr, sdInflationFactor };
 }
 
 /** Reads the Params sheet as a 2-column table: Param | Value. Returns {ParamName: Value}. */
@@ -433,8 +435,8 @@ function buildScenarioMultipliers(scen, factors, log) {
     macroeconomic: 'Disabled' 
   };
   
-  // Map Enabled/Disabled to Strong/Weak to match spreadsheet columns
-  const mapState = (state) => (state === 'Enabled' ? 'Strong' : 'Weak');
+  // Factor state IS the column suffix used in Scenario_Mapping ("Enabled"/"Disabled").
+  const mapState = (state) => (state === 'Enabled' ? 'Enabled' : 'Disabled');
   
   for (const r of scen.rows) {
     const c = cleanChannel(r.Channel);
@@ -443,12 +445,12 @@ function buildScenarioMultipliers(scen, factors, log) {
     
     const key = `${c}|${fy}`;
     
-    // Calculate mean multiplier by multiplying selected factor values
-    // Note: Using "people" not "org_stability" to match sheet column naming
+    // Calculate mean multiplier by multiplying selected factor values.
+    // Column names in Scenario_Mapping: <factor>_Enabled / <factor>_Disabled.
     let meanMult = 1.0;
     meanMult *= Number(r[`mng_giving_${mapState(f.mng_giving)}`] || 1);
     meanMult *= Number(r[`product_marketing_${mapState(f.product_marketing)}`] || 1);
-    meanMult *= Number(r[`people_${mapState(f.org_stability)}`] || 1);  // "people" in sheet, "org_stability" in params
+    meanMult *= Number(r[`org_stability_${mapState(f.org_stability)}`] || 1);
     meanMult *= Number(r[`govt_policy_${mapState(f.govt_policy)}`] || 1);
     meanMult *= Number(r[`macro_${mapState(f.macroeconomic)}`] || 1);
     
@@ -502,7 +504,7 @@ function applyScenarioAdjustments(baseBounds, channel, factors, adjustments) {
   const factorMap = {
     'internal_mng_giving': factors.mng_giving,
     'internal_product_marketing': factors.product_marketing,
-    'internal_org_stability': factors.org_stability,
+    'internal_people': factors.org_stability,
     'external_govt_ed_policy': factors.govt_policy,
     'external_macroeconomic': factors.macroeconomic
   };
